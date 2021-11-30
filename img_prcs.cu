@@ -109,8 +109,7 @@ bool LoadImage(const char *file, unsigned char **data, unsigned int *w, unsigned
         *w = width;
         *h = height;
     }
-
-    // read and close file
+    
     if (fread(*data, sizeof(unsigned char), width * height * *channels, fp) == 0)
     {
         fclose(fp);
