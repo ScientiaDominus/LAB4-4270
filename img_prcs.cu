@@ -4,24 +4,52 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 
-#define PGMHeaderSize           0x40
 
-inline bool loadPPM(const char *file, unsigned char **data, unsigned int *w, unsigned int *h, unsigned int *channels)
+#define H_Size           0x40
+#define TILE_WIDTH      16
+#define TILE_HEIGHT      16
+#define x_radius          3                       
+#define y_radius          3  
+#define BLUR_SIZE   6                     
+#define FILTER_WIDTH    (x_radius*2+1)                
+#define FILTER_HEIGHT    (y_radius*2+1)                
+#define S           (FILTER_WIDTH*FILTER_HEIGHT)    
+#define BLOCK_W     (TILE_WIDTH+(2*x_radius))
+#define BLOCK_H     (TILE_HEIGHT+(2*y_radius))
+
+/*
+IMPORTANT INFORMATION:
+This program will ONLY read pgm format images to blur. 
+
+In order to run the program you must use the command line arguments to enter the name of the file you wish to process.
+
+This program can only process one image at a time. 
+
+The program applies the box_filter and the Gaussian Blur filter to the image you entered. The result of these filters will be saved in "output_box.pgm" and "output_gauss.pgm."
+
+cuda8 environment was used for this code.   
+*/
+
+
+
+bool LoadImage(const char *file, unsigned char **data, unsigned int *w, unsigned int *h, unsigned int *channels)
 {
     FILE *fp = NULL;
+    unsigned int width = 0;
+    unsigned int height = 0;
+    unsigned int maxval = 0;
+    unsigned int i = 0;
+    char header[H_Size];
 
     fp = fopen(file, "rb");
          if (!fp) {
-              fprintf(stderr, "__LoadPPM() : unable to open file\n" );
+             printf("ERROR READING FILE FAILED\n");
                 return false;
          }
 
-    // check header
-    char header[PGMHeaderSize];
 
-    if (fgets(header, PGMHeaderSize, fp) == NULL)
+    if (fgets(header, H_Size, fp) == NULL)
     {
-        fprintf(stderr,"__LoadPPM() : reading PGM header returned NULL\n" );
         return false;
     }
 
@@ -35,22 +63,16 @@ inline bool loadPPM(const char *file, unsigned char **data, unsigned int *w, uns
     }
     else
     {
-        fprintf(stderr,"__LoadPPM() : File is not a PPM or PGM image\n" );
         *channels = 0;
         return false;
     }
 
     // parse header, read maxval, width and height
-    unsigned int width = 0;
-    unsigned int height = 0;
-    unsigned int maxval = 0;
-    unsigned int i = 0;
 
     while (i < 3)
     {
-        if (fgets(header, PGMHeaderSize, fp) == NULL)
+        if (fgets(header, H_Size, fp) == NULL)
         {
-            fprintf(stderr,"__LoadPPM() : reading PGM header returned NULL\n" );
             return false;
         }
 
@@ -78,14 +100,13 @@ inline bool loadPPM(const char *file, unsigned char **data, unsigned int *w, uns
     {
         if (*w != width || *h != height)
         {
-            fprintf(stderr, "__LoadPPM() : Invalid image dimensions.\n" );
+            return false;
         }
     }
     else
     {
         *data = (unsigned char *) malloc(sizeof(unsigned char) * width * height * *channels);
         if (!data) {
-         fprintf(stderr, "Unable to allocate hostmemory\n");
          return false;
         }
         *w = width;
@@ -95,7 +116,6 @@ inline bool loadPPM(const char *file, unsigned char **data, unsigned int *w, uns
     // read and close file
     if (fread(*data, sizeof(unsigned char), width * height * *channels, fp) == 0)
     {
-        fprintf(stderr, "__LoadPPM() : read data returned error.\n" );
         fclose(fp);
         return false;
     }
@@ -105,7 +125,7 @@ inline bool loadPPM(const char *file, unsigned char **data, unsigned int *w, uns
     return true;
 }
 
-inline bool savePPM(const char *file, unsigned char *data, unsigned int w, unsigned int h, unsigned int channels)
+bool SaveFile(const char *file, unsigned char *data, unsigned int w, unsigned int h, unsigned int channels)
 {
     assert(NULL != data);
     assert(w > 0);
@@ -115,7 +135,6 @@ inline bool savePPM(const char *file, unsigned char *data, unsigned int w, unsig
 
     if (fh.bad())
     {
-        fprintf(stderr, "__savePPM() : Opening file failed.\n" );
         return false;
     }
 
@@ -129,7 +148,6 @@ inline bool savePPM(const char *file, unsigned char *data, unsigned int w, unsig
     }
     else
     {
-        fprintf(stderr, "__savePPM() : Invalid number of channels.\n" );
         return false;
     }
 
@@ -144,7 +162,6 @@ inline bool savePPM(const char *file, unsigned char *data, unsigned int w, unsig
 
     if (fh.bad())
     {
-        fprintf(stderr,"__savePPM() : Writing data failed.\n" );
         return false;
     }
 
@@ -153,51 +170,42 @@ inline bool savePPM(const char *file, unsigned char *data, unsigned int w, unsig
     return true;
 }
 
-#define TILE_W      16
-#define TILE_H      16
-#define Rx          2                       // filter radius in x direction
-#define Ry          2                       // filter radius in y direction
-#define FILTER_W    (Rx*2+1)                // filter diameter in x direction
-#define FILTER_H    (Ry*2+1)                // filter diameter in y direction
-#define S           (FILTER_W*FILTER_H)     // filter size
-#define BLUR_SIZE   1
-#define BLOCK_W     (TILE_W+(2*Rx))
-#define BLOCK_H     (TILE_H+(2*Ry))
 
 __global__ void box_filter(const unsigned char *in, unsigned char *out, const unsigned int w, const unsigned int h){
     //Indexes
-    const int x = blockIdx.x * TILE_W + threadIdx.x - Rx;       // x image index
-    const int y = blockIdx.y * TILE_H + threadIdx.y - Ry;       // y image index
-    const int d = y * w + x;                                    // data index
+    const int x = blockIdx.x * TILE_WIDTH + threadIdx.x - x_radius;       
+    const int y = blockIdx.y * TILE_HEIGHT + threadIdx.y - y_radius;       
+    const int d = y * w + x;                                    
 
     //shared mem
-    __shared__ float shMem[BLOCK_W][BLOCK_H];
-    if(x<0 || y<0 || x>=w || y>=h) {            // Threads which are not in the picture just write 0 to the shared mem
-        shMem[threadIdx.x][threadIdx.y] = 0;
+    __shared__ float Memoy_radius[BLOCK_W][BLOCK_H];
+    if(x<0 || y<0 || x>=w || y>=h) {            
+        Memoy_radius[threadIdx.x][threadIdx.y] = 0;
         return; 
     }
-    shMem[threadIdx.x][threadIdx.y] = in[d];
+    Memoy_radius[threadIdx.x][threadIdx.y] = in[d];
     __syncthreads();
 
     // box filter (only for threads inside the tile)
-    if ((threadIdx.x >= Rx) && (threadIdx.x < (BLOCK_W-Rx)) && (threadIdx.y >= Ry) && (threadIdx.y < (BLOCK_H-Ry))) {
+    if ((threadIdx.x >= x_radius) && (threadIdx.x < (BLOCK_W-x_radius)) && (threadIdx.y >= y_radius) && (threadIdx.y < (BLOCK_H-y_radius))) {
         float sum = 0;
-        for(int dx=-Rx; dx<=Rx; dx++) {
-            for(int dy=-Ry; dy<=Ry; dy++) {
-                sum += shMem[threadIdx.x+dx][threadIdx.y+dy];
+        for(int dx=-x_radius; dx<=x_radius; dx++) {
+            for(int dy=-y_radius; dy<=y_radius; dy++) {
+                sum += Memoy_radius[threadIdx.x+dx][threadIdx.y+dy];
             }
         }
     out[d] = sum / S;       
     }
 }
-__global__ void Gaussian(unsigned char *in, unsigned char *out, int w, int h) 
+//This function implements the Gaussian blur algorithm on the GPU
+__global__ void Gaussian(unsigned char *in, unsigned char *out, const unsigned int w, const unsigned int h) 
 { 
     int Col = blockIdx.x * blockDim.x + threadIdx.x; 
     int Row = blockIdx.y * blockDim.y + threadIdx.y;
     if (Col < w && Row < h) 
     { 
-        int pixVal = 0; 
-        int pixels = 0;
+        int value = 0; 
+        int pixelCount = 0;
         // Get the average of the surrounding BLUR_SIZE x BLUR_SIZE box 
             for(int blurRow = -BLUR_SIZE; blurRow < BLUR_SIZE+1; ++blurRow) 
                 { 
@@ -209,118 +217,103 @@ __global__ void Gaussian(unsigned char *in, unsigned char *out, int w, int h)
                         // Verify we have a valid image pixel 
                         if(curRow > -1 && curRow < h && curCol > -1 && curCol < w) 
                             { 
-                                pixVal += in[curRow * w + curCol]; 
-                                pixels++; // Keep track of number of pixels in the avg 
+                                value += in[curRow * w + curCol]; 
+                                pixelCount++; // Keep track of number of pixels in the avg 
                             } 
                     } 
                 } 
             // Write our new pixel value out 
-        out[Row * w + Col] = (unsigned char)(pixVal / pixels); 
+        out[Row * w + Col] = (unsigned char)(value / pixelCount); 
     } 
 }
 
-#define checkCudaErrors(err)           __checkCudaErrors (err, __FILE__, __LINE__)
-
-inline void __checkCudaErrors(cudaError err, const char *file, const int line)
-{
-    if (cudaSuccess != err)
-    {
-        fprintf(stderr, "%s(%i) : CUDA Runtime API error %d: %s.\n",
-                file, line, (int)err, cudaGetErrorString(err));
-        exit(EXIT_FAILURE);
-    }
-}
-
-int main(){
-    unsigned char *data=NULL, *d_idata=NULL, *d_odata=NULL;
+int main(int argc, char* argv[]){
+    unsigned char *data=NULL, *d_in=NULL, *d_out=NULL;
     unsigned int w,h,channels;
+    int GRID_W = 0;
+    int GRID_H = 0;
 
-    if(! loadPPM("puppy.pgm", &data, &w, &h, &channels)){
-        fprintf(stderr, "Failed to open File\n");
+    if(argc < 2)
+    {
+        int i =0;
+        while(i != 10)
+        {
+            printf("WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING\n");
+            i++;
+        }
+        printf("ERROR: NO INPUT FILE SELECTED! USE %s <INPUT FILE> \n\n", argv[0]);
+        exit(1);
+    }
+    char* filename = (char*)malloc(strlen(argv[1])*sizeof(char));
+    strcpy(filename, argv[1]);
+
+    if(! LoadImage(filename, &data, &w, &h, &channels)){
         exit(EXIT_FAILURE);
     }
 
-    printf("Loaded file with   w:%d   h:%d   channels:%d \n",w,h,channels);
+    GRID_W = w/TILE_WIDTH +1;
+    GRID_H = h/TILE_HEIGHT +1;
+
+    printf("File loaded, Starting process\n");
 
     unsigned int numElements = w*h*channels;
-    size_t datasize = numElements * sizeof(unsigned char);
+    size_t memSize = numElements * sizeof(unsigned char);
 
-    // Allocate the Device Memory
-    printf("Allocate Devicememory for data\n");
-    checkCudaErrors(cudaMalloc((void **)&d_idata, datasize));
-    checkCudaErrors(cudaMalloc((void **)&d_odata, datasize));
+    // Allocate the Device Memoy_radius
+    cudaMalloc((void **)&d_in, memSize);
+    cudaMalloc((void **)&d_out, memSize);
 
     // Copy to device
-    printf("Copy idata from the host memory to the CUDA device\n");
-    checkCudaErrors(cudaMemcpy(d_idata, data, datasize, cudaMemcpyHostToDevice));
+    cudaMemcpy(d_in, data, memSize, cudaMemcpyHostToDevice);
 
-    // Launch Kernel
-    int GRID_W = w/TILE_W +1;
-    int GRID_H = h/TILE_H +1;
     dim3 threadsPerBlock(BLOCK_W, BLOCK_H);
     dim3 blocksPerGrid(GRID_W,GRID_H);
-    printf("CUDA kernel launch with [%d %d] blocks of [%d %d] threads\n", blocksPerGrid.x, blocksPerGrid.y, threadsPerBlock.x, threadsPerBlock.y);
-    box_filter<<<blocksPerGrid, threadsPerBlock>>>(d_idata, d_odata, w,h);
-    checkCudaErrors(cudaGetLastError());
+    box_filter<<<blocksPerGrid, threadsPerBlock>>>(d_in, d_out, w,h);
+    cudaMemcpy(data, d_out, memSize, cudaMemcpyDeviceToHost);
+    cudaFree(d_in);
+    cudaFree(d_out);
 
-    // Copy data from device to host
-    printf("Copy odata from the CUDA device to the host memory\n");
-    checkCudaErrors(cudaMemcpy(data, d_odata, datasize, cudaMemcpyDeviceToHost));
-    printf("Free Device memory\n");
-    checkCudaErrors(cudaFree(d_idata));
-    checkCudaErrors(cudaFree(d_odata));
-
-    printf("Save Picture\n");
+    printf("Box Filter complete, saving image\n");
     bool saved = false;
-    if      (channels==1)
+    if (channels==1)
     {
-        saved = savePPM("output_box.pgm", data, w,  h,  channels);
-        //saved = savePPM("output.pgm", data2, w,  h,  channels);
+        saved = SaveFile("output_box.pgm", data, w,  h,  channels);
     }
     else if (channels==3)
     {
-        saved = savePPM("output_box.ppm", data, w,  h,  channels);
-        //saved = savePPM("output.ppm", data2, w,  h,  channels);
+        saved = SaveFile("output_box.ppm", data, w,  h,  channels);
     }
     else fprintf(stderr, "ERROR: Unable to save file - wrong channel!\n");
 
-    checkCudaErrors(cudaMalloc((void **)&d_idata, datasize));
-    checkCudaErrors(cudaMalloc((void **)&d_odata, datasize));
-    printf("Copy idata from the host memory to the CUDA device\n");
-    checkCudaErrors(cudaMemcpy(d_idata, data, datasize, cudaMemcpyHostToDevice));
-    printf("CUDA kernel launch with [%d %d] blocks of [%d %d] threads\n", blocksPerGrid.x, blocksPerGrid.y, threadsPerBlock.x, threadsPerBlock.y);
-    Gaussian<<<blocksPerGrid, threadsPerBlock>>>(d_idata, d_odata, w, h);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaMemcpy(data, d_odata, datasize, cudaMemcpyDeviceToHost));
-    // Free Device memory
-    printf("Free Device memory\n");
-    checkCudaErrors(cudaFree(d_idata));
-    checkCudaErrors(cudaFree(d_odata));
+    cudaMalloc((void **)&d_in, memSize);
+    cudaMalloc((void **)&d_out, memSize);
+    cudaMemcpy(d_in, data, memSize, cudaMemcpyHostToDevice);
+    Gaussian<<<blocksPerGrid, threadsPerBlock>>>(d_in, d_out, w, h);
+    cudaMemcpy(data, d_out, memSize, cudaMemcpyDeviceToHost);
+    cudaFree(d_in);
+    cudaFree(d_out);
 
 
     // Save Picture
-    printf("Save Picture\n");
+    printf("Gaussian Blur complete, saving image\n");
     saved = false;
-    if      (channels==1)
+    if (channels==1)
     {
-        saved = savePPM("output_gauss.pgm", data, w,  h,  channels);
-        //saved = savePPM("output.pgm", data2, w,  h,  channels);
+        saved = SaveFile("output_gauss.pgm", data, w,  h,  channels);
     }
     else if (channels==3)
     {
-        saved = savePPM("output_gauss.ppm", data, w,  h,  channels);
-        //saved = savePPM("output.ppm", data2, w,  h,  channels);
+        saved = SaveFile("output_gauss.ppm", data, w,  h,  channels);
     }
-    else fprintf(stderr, "ERROR: Unable to save file - wrong channel!\n");
+    else fprintf(stderr, "ERROR: Unable to save file - unrecognized format\n");
 
-    // Free Host memory
-    printf("Free Host memory\n");
     free(data);
 
     if (!saved){
         fprintf(stderr, "Failed to save File\n");
         exit(EXIT_FAILURE);
     }
+    free(filename);
 
     printf("Done\n");
 }
