@@ -127,71 +127,62 @@ bool LoadImage(const char *file, unsigned char **data, unsigned int *w, unsigned
 
 bool SaveFile(const char *file, unsigned char *data, unsigned int w, unsigned int h, unsigned int channels)
 {
-    assert(NULL != data);
-    assert(w > 0);
-    assert(h > 0);
+    std::fstream Image(file, std::fstream::out | std::fstream::binary);
 
-    std::fstream fh(file, std::fstream::out | std::fstream::binary);
-
-    if (fh.bad())
+    if (Image.bad())
     {
         return false;
     }
 
     if (channels == 1)
     {
-        fh << "P5\n";
+        Image << "P5\n";
     }
     else if (channels == 3)
     {
-        fh << "P6\n";
+        Image << "P6\n";
     }
     else
     {
+        Image.close();
         return false;
     }
 
-    fh << w << "\n" << h << "\n" << 0xff << std::endl;
+    Image << w << "\n" << h << "\n" << 0xff << std::endl;
 
-    for (unsigned int i = 0; (i < (w*h*channels)) && fh.good(); ++i)
+    for (unsigned int i = 0; (i < (w*h*channels)) && Image.good(); ++i)
     {
-        fh << data[i];
+        Image << data[i];
     }
-
-    fh.flush();
-
-    if (fh.bad())
+    if (Image.bad())
     {
+        Image.close();
         return false;
     }
-
-    fh.close();
+    Image.close();
 
     return true;
 }
 
-
+//This function implements the box_filter algorithm
 __global__ void box_filter(const unsigned char *in, unsigned char *out, const unsigned int w, const unsigned int h){
-    //Indexes
     const int x = blockIdx.x * TILE_WIDTH + threadIdx.x - x_radius;       
     const int y = blockIdx.y * TILE_HEIGHT + threadIdx.y - y_radius;       
     const int d = y * w + x;                                    
 
-    //shared mem
-    __shared__ float Memoy_radius[BLOCK_W][BLOCK_H];
+    __shared__ float Memory[BLOCK_W][BLOCK_H];
     if(x<0 || y<0 || x>=w || y>=h) {            
-        Memoy_radius[threadIdx.x][threadIdx.y] = 0;
+        Memory[threadIdx.x][threadIdx.y] = 0;
         return; 
     }
-    Memoy_radius[threadIdx.x][threadIdx.y] = in[d];
+    Memory[threadIdx.x][threadIdx.y] = in[d];
     __syncthreads();
 
-    // box filter (only for threads inside the tile)
     if ((threadIdx.x >= x_radius) && (threadIdx.x < (BLOCK_W-x_radius)) && (threadIdx.y >= y_radius) && (threadIdx.y < (BLOCK_H-y_radius))) {
         float sum = 0;
         for(int dx=-x_radius; dx<=x_radius; dx++) {
             for(int dy=-y_radius; dy<=y_radius; dy++) {
-                sum += Memoy_radius[threadIdx.x+dx][threadIdx.y+dy];
+                sum += Memory[threadIdx.x+dx][threadIdx.y+dy];
             }
         }
     out[d] = sum / S;       
