@@ -67,8 +67,6 @@ bool LoadImage(const char *file, unsigned char **data, unsigned int *w, unsigned
         return false;
     }
 
-    // parse header, read maxval, width and height
-
     while (i < 3)
     {
         if (fgets(header, H_Size, fp) == NULL)
@@ -95,7 +93,6 @@ bool LoadImage(const char *file, unsigned char **data, unsigned int *w, unsigned
         }
     }
 
-    // check if given handle for the data is initialized
     if (NULL != *data)
     {
         if (*w != width || *h != height)
@@ -197,23 +194,20 @@ __global__ void Gaussian(unsigned char *in, unsigned char *out, const unsigned i
     { 
         int value = 0; 
         int pixelCount = 0;
-        // Get the average of the surrounding BLUR_SIZE x BLUR_SIZE box 
             for(int blurRow = -BLUR_SIZE; blurRow < BLUR_SIZE+1; ++blurRow) 
                 { 
                     for(int blurCol = -BLUR_SIZE; blurCol < BLUR_SIZE+1; ++blurCol) 
                     {
                         int curRow = Row + blurRow; 
                         int curCol = Col + blurCol; 
-
-                        // Verify we have a valid image pixel 
+ 
                         if(curRow > -1 && curRow < h && curCol > -1 && curCol < w) 
                             { 
                                 value += in[curRow * w + curCol]; 
-                                pixelCount++; // Keep track of number of pixels in the avg 
+                                pixelCount++; 
                             } 
                     } 
                 } 
-            // Write our new pixel value out 
         out[Row * w + Col] = (unsigned char)(value / pixelCount); 
     } 
 }
@@ -250,11 +244,9 @@ int main(int argc, char* argv[]){
     unsigned int numElements = w*h*channels;
     size_t memSize = numElements * sizeof(unsigned char);
 
-    // Allocate the Device Memoy_radius
     cudaMalloc((void **)&d_in, memSize);
     cudaMalloc((void **)&d_out, memSize);
 
-    // Copy to device
     cudaMemcpy(d_in, data, memSize, cudaMemcpyHostToDevice);
 
     dim3 threadsPerBlock(BLOCK_W, BLOCK_H);
